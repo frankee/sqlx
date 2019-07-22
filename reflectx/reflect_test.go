@@ -1,6 +1,9 @@
 package reflectx
 
 import (
+	"database/sql"
+	"database/sql/driver"
+	"github.com/bmizerany/assert"
 	"reflect"
 	"strings"
 	"testing"
@@ -42,8 +45,8 @@ func TestBasicEmbedded(t *testing.T) {
 
 	type Bar struct {
 		Foo // `db:""` is implied for an embedded struct
-		B   int
-		C   int `db:"-"`
+		B int
+		C int `db:"-"`
 	}
 
 	type Baz struct {
@@ -113,13 +116,13 @@ func TestBasicEmbeddedWithTags(t *testing.T) {
 	}
 
 	type Bar struct {
-		Foo     // `db:""` is implied for an embedded struct
-		B   int `db:"b"`
+		Foo // `db:""` is implied for an embedded struct
+		B int `db:"b"`
 	}
 
 	type Baz struct {
-		A   int `db:"a"`
-		Bar     // `db:""` is implied for an embedded struct
+		A int `db:"a"`
+		Bar // `db:""` is implied for an embedded struct
 	}
 
 	m := NewMapper("db")
@@ -792,7 +795,7 @@ func TestFieldByIndexes(t *testing.T) {
 			}
 		}
 
-		checkResults(FieldByIndexes(reflect.ValueOf(tc.value), tc.indexes))
+		checkResults(FieldByIndexes(reflect.ValueOf(tc.value), tc.indexes, NewMapper("")))
 		if tc.readOnly {
 			checkResults(FieldByIndexesReadOnly(reflect.ValueOf(tc.value), tc.indexes))
 		}
@@ -811,7 +814,7 @@ func TestMustBe(t *testing.T) {
 				t.Error("expected panic with *reflect.ValueError")
 				return
 			}
-			if valueErr.Method != "github.com/jmoiron/sqlx/reflectx.TestMustBe" {
+			if valueErr.Method != "github.com/frankee/sqlx/reflectx.TestMustBe" {
 			}
 			if valueErr.Kind != reflect.String {
 				t.Errorf("unexpected Kind: %s", valueErr.Kind)
@@ -824,6 +827,98 @@ func TestMustBe(t *testing.T) {
 	typ = reflect.TypeOf("string")
 	mustBe(typ, reflect.Struct)
 	t.Error("got here, didn't expect to")
+}
+
+type District struct {
+	Id    string
+	Name  string
+	Type  string
+	Level int32
+}
+
+type Address struct {
+	Districts []*District
+}
+
+type Place struct {
+	Id      string
+	Name    string
+	Address *Address
+}
+
+type CityIdOfAddress struct {
+	Delegate *Address
+	City     string
+}
+
+func (c *CityIdOfAddress) SetDelegateField(d interface{}) {
+	address := d.(*Address)
+	if address != nil {
+		c.Delegate = address
+		for _, d := range address.Districts {
+			if d.Type == "City" {
+				c.City = d.Id
+			}
+		}
+	}
+}
+
+func (c CityIdOfAddress) Value() (driver.Value, error) {
+	return c.City, nil
+}
+
+func (c *CityIdOfAddress) Scan(src interface{}) error {
+	id := src.(string)
+	if len(id) > 0 {
+		for _, d := range c.Delegate.Districts {
+			if d.Type == "City" {
+				d.Id = id
+				return nil
+			}
+		}
+
+		c.Delegate.Districts = append(c.Delegate.Districts, &District{
+			Id:   id,
+			Type: "City",
+		})
+	}
+	return nil
+}
+
+func TestBasicVirtualField(t *testing.T) {
+	mpr := NewMapperFunc("db", strings.ToLower)
+	mpr.Register(reflect.TypeOf(Address{}), "city_id", reflect.TypeOf(CityIdOfAddress{}))
+
+	p := Place{Id: "123", Name: "Shanghai", Address: &Address{Districts: []*District{{Id: "456", Type: "City"}}}}
+
+	mapping := mpr.TypeMap(reflect.TypeOf(p))
+	for _, key := range []string{"id", "name", "address.city_id"} {
+		if fi := mapping.GetByPath (key); fi == nil {
+			t.Errorf("Expecting to find key %s in mapping but did not.", key)
+		}
+	}
+
+	for _, key := range []string{"id", "name", "city_id"} {
+		if fi := mapping.GetByName (key); fi == nil {
+			t.Errorf("Expecting to find key %s in mapping but did not.", key)
+		}
+	}
+
+	values := mpr.FieldsByName(reflect.ValueOf(p), []string{"id", "name", "city_id"})
+	assert.Equal(t, values[0].String(), p.Id)
+	assert.Equal(t, values[1].String(), p.Name)
+
+	valuer := values[2].Interface().(driver.Valuer)
+	v, _ := valuer.Value()
+	assert.Equal(t, v.(string), p.Address.Districts[0].Id)
+
+	//reflect.Indirect(values[0]).Set(reflect.ValueOf("321"))
+	//reflect.Indirect(values[1]).Set(reflect.ValueOf("Beijing"))
+	values[2].Interface().(sql.Scanner).Scan("654")
+
+	//assert.Equal(t, p.Id, "321")
+	//assert.Equal(t, p.Name, "Beijing")
+	assert.Equal(t, p.Address.Districts[0].Id, "654")
 }
 
 type E1 struct {
@@ -897,7 +992,7 @@ func BenchmarkFieldByIndexL4(b *testing.B) {
 	idx := []int{0, 0, 0, 0}
 	for i := 0; i < b.N; i++ {
 		v := reflect.ValueOf(e4)
-		f := FieldByIndexes(v, idx)
+		f := FieldByIndexes(v, idx, NewMapper(""))
 		if f.Interface().(int) != 1 {
 			b.Fatal("Wrong value.")
 		}

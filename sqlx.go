@@ -12,7 +12,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/jmoiron/sqlx/reflectx"
+	"github.com/frankee/sqlx/reflectx"
 )
 
 // Although the NameMapper is convenient, in practice it should not
@@ -1025,7 +1025,7 @@ func fieldsByTraversal(v reflect.Value, traversals [][]int, values []interface{}
 			values[i] = new(interface{})
 			continue
 		}
-		f := reflectx.FieldByIndexes(v, traversal)
+		f := reflectx.FieldByIndexes(v, traversal, mapper())
 		if ptrs {
 			values[i] = f.Addr().Interface()
 		} else {

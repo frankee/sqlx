@@ -24,6 +24,9 @@ type FieldInfo struct {
 	Embedded bool
 	Children []*FieldInfo
 	Parent   *FieldInfo
+
+	Virtual     bool
+	VirtualType reflect.Type
 }
 
 // A StructMap is an index of field metadata for a struct.
@@ -37,6 +40,11 @@ type StructMap struct {
 // GetByPath returns a *FieldInfo for a given string path.
 func (f StructMap) GetByPath(path string) *FieldInfo {
 	return f.Paths[path]
+}
+
+// GetByPath returns a *FieldInfo for a given string name.
+func (f StructMap) GetByName(name string) *FieldInfo {
+	return f.Names[name]
 }
 
 // GetByTraversal returns a *FieldInfo for a given integer path.  It is
@@ -57,11 +65,15 @@ func (f StructMap) GetByTraversal(index []int) *FieldInfo {
 	return tree
 }
 
+type Register = map[reflect.Type]map[string]reflect.Type
+
 // Mapper is a general purpose mapper of names to struct fields.  A Mapper
 // behaves like most marshallers in the standard library, obeying a field tag
 // for name mapping but also providing a basic transform function.
 type Mapper struct {
-	cache      map[reflect.Type]*StructMap
+	cache    map[reflect.Type]*StructMap
+	registry Register
+
 	tagName    string
 	tagMapFunc func(string) string
 	mapFunc    func(string) string
@@ -72,8 +84,9 @@ type Mapper struct {
 // If tagName is the empty string, it is ignored.
 func NewMapper(tagName string) *Mapper {
 	return &Mapper{
-		cache:   make(map[reflect.Type]*StructMap),
-		tagName: tagName,
+		cache:    make(map[reflect.Type]*StructMap),
+		registry: make(Register),
+		tagName:  tagName,
 	}
 }
 
@@ -83,6 +96,7 @@ func NewMapper(tagName string) *Mapper {
 func NewMapperTagFunc(tagName string, mapFunc, tagMapFunc func(string) string) *Mapper {
 	return &Mapper{
 		cache:      make(map[reflect.Type]*StructMap),
+		registry:   make(Register),
 		tagName:    tagName,
 		mapFunc:    mapFunc,
 		tagMapFunc: tagMapFunc,
@@ -94,10 +108,23 @@ func NewMapperTagFunc(tagName string, mapFunc, tagMapFunc func(string) string) *
 // for any other field, the mapped name will be f(field.Name)
 func NewMapperFunc(tagName string, f func(string) string) *Mapper {
 	return &Mapper{
-		cache:   make(map[reflect.Type]*StructMap),
-		tagName: tagName,
-		mapFunc: f,
+		cache:    make(map[reflect.Type]*StructMap),
+		registry: make(Register),
+		tagName:  tagName,
+		mapFunc:  f,
 	}
+}
+
+//
+//
+func (m *Mapper) Register(t reflect.Type, name string, vf reflect.Type) {
+	vfs := m.registry[t]
+	if vfs == nil {
+		vfs = make(map[string]reflect.Type)
+		m.registry[t] = vfs
+	}
+
+	vfs[name] = vf
 }
 
 // TypeMap returns a mapping of field strings to int slices representing
@@ -106,7 +133,7 @@ func (m *Mapper) TypeMap(t reflect.Type) *StructMap {
 	m.mutex.Lock()
 	mapping, ok := m.cache[t]
 	if !ok {
-		mapping = getMapping(t, m.tagName, m.mapFunc, m.tagMapFunc)
+		mapping = getMapping(t, m.tagName, m.mapFunc, m.tagMapFunc, m)
 		m.cache[t] = mapping
 	}
 	m.mutex.Unlock()
@@ -122,7 +149,7 @@ func (m *Mapper) FieldMap(v reflect.Value) map[string]reflect.Value {
 	r := map[string]reflect.Value{}
 	tm := m.TypeMap(v.Type())
 	for tagName, fi := range tm.Names {
-		r[tagName] = FieldByIndexes(v, fi.Index)
+		r[tagName] = FieldByIndexes(v, fi.Index, m)
 	}
 	return r
 }
@@ -139,7 +166,7 @@ func (m *Mapper) FieldByName(v reflect.Value, name string) reflect.Value {
 	if !ok {
 		return v
 	}
-	return FieldByIndexes(v, fi.Index)
+	return FieldByIndexes(v, fi.Index, m)
 }
 
 // FieldsByName returns a slice of values corresponding to the slice of names
@@ -156,7 +183,7 @@ func (m *Mapper) FieldsByName(v reflect.Value, names []string) []reflect.Value {
 		if !ok {
 			vals = append(vals, *new(reflect.Value))
 		} else {
-			vals = append(vals, FieldByIndexes(v, fi.Index))
+			vals = append(vals, FieldByIndexes(v, fi.Index, m))
 		}
 	}
 	return vals
@@ -203,16 +230,28 @@ func (m *Mapper) TraversalsByNameFunc(t reflect.Type, names []string, fn func(in
 
 // FieldByIndexes returns a value for the field given by the struct traversal
 // for the given value.
-func FieldByIndexes(v reflect.Value, indexes []int) reflect.Value {
+func FieldByIndexes(v reflect.Value, indexes []int, m *Mapper) reflect.Value {
+	tm := m.TypeMap(v.Type())
+	fi := tm.Tree
 	for _, i := range indexes {
-		v = reflect.Indirect(v).Field(i)
-		// if this is a pointer and it's nil, allocate a new value and set it
-		if v.Kind() == reflect.Ptr && v.IsNil() {
-			alloc := reflect.New(Deref(v.Type()))
-			v.Set(alloc)
-		}
-		if v.Kind() == reflect.Map && v.IsNil() {
-			v.Set(reflect.MakeMap(v.Type()))
+		fi = fi.Children[i]
+		if !fi.Virtual {
+			v = reflect.Indirect(v).Field(i)
+			// if this is a pointer and it's nil, allocate a new value and set it
+			if v.Kind() == reflect.Ptr && v.IsNil() {
+				alloc := reflect.New(Deref(v.Type()))
+				v.Set(alloc)
+			}
+			if v.Kind() == reflect.Map && v.IsNil() {
+				v.Set(reflect.MakeMap(v.Type()))
+			}
+		} else {
+			alloc := reflect.New(Deref(fi.VirtualType))
+
+			method := alloc.MethodByName("SetDelegateField")
+			method.Call([]reflect.Value{v})
+
+			return alloc
 		}
 	}
 	return v
@@ -340,7 +379,7 @@ func parseOptions(tag string) map[string]string {
 
 // getMapping returns a mapping for the t type, using the tagName, mapFunc and
 // tagMapFunc to determine the canonical names of fields.
-func getMapping(t reflect.Type, tagName string, mapFunc, tagMapFunc mapf) *StructMap {
+func getMapping(t reflect.Type, tagName string, mapFunc, tagMapFunc mapf, mapper *Mapper) *StructMap {
 	m := []*FieldInfo{}
 
 	root := &FieldInfo{}
@@ -361,6 +400,34 @@ QueueLoop:
 		}
 
 		nChildren := 0
+		if fields, ok := mapper.registry[tq.t]; ok {
+			nChildren = len(fields)
+			tq.fi.Children = make([]*FieldInfo, nChildren)
+			fieldPos := 0
+			for name, field := range fields {
+				//f := tq.t.Field(fieldPos)
+				fi := FieldInfo{
+					Field:       reflect.StructField{},
+					Name:        name,
+					Zero:        reflect.New(field).Elem(),
+					Virtual:     true,
+					VirtualType: field,
+				}
+
+				if tq.pp == "" {
+					fi.Path = fi.Name
+				} else {
+					fi.Path = tq.pp + "." + fi.Name
+				}
+
+				fi.Index = apnd(tq.fi.Index, fieldPos)
+				fi.Parent = tq.fi
+				tq.fi.Children[fieldPos] = &fi
+				m = append(m, &fi)
+			}
+			continue
+		}
+
 		if tq.t.Kind() == reflect.Struct {
 			nChildren = tq.t.NumField()
 		}
@@ -433,6 +500,24 @@ QueueLoop:
 		if fi.Name != "" && !fi.Embedded {
 			flds.Names[fi.Path] = fi
 		}
+	}
+
+	duplicatedNames := make(map[string]bool)
+	for _, fi := range flds.Index {
+		if fi.Name != "" && !fi.Embedded {
+			fld, ok := flds.Names[fi.Name]
+			if ok {
+				if fld.Parent.Parent != nil { // not first level field
+					duplicatedNames[fi.Name] = true
+				}
+			} else {
+				flds.Names[fi.Name] = fi
+			}
+		}
+	}
+
+	for key := range duplicatedNames {
+		delete(flds.Names, key)
 	}
 
 	return flds
