@@ -520,5 +520,12 @@ QueueLoop:
 		delete(flds.Names, key)
 	}
 
+	for name, fi := range flds.Paths {
+		n := strings.Replace(name, ".", "_", -1)
+		if name != n {
+			flds.Paths[n] = fi
+		}
+	}
+
 	return flds
 }
