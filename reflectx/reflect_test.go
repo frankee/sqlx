@@ -836,14 +836,20 @@ type District struct {
 	Level int32
 }
 
+type Category struct {
+	Id   string
+	Name string
+}
+
 type Address struct {
 	Districts []*District
 }
 
 type Place struct {
-	Id      string
-	Name    string
-	Address *Address
+	Id         string
+	Name       string
+	Address    *Address
+	Categories []*Category
 }
 
 type CityIdOfAddress struct {
@@ -885,26 +891,62 @@ func (c *CityIdOfAddress) Scan(src interface{}) error {
 	return nil
 }
 
+type CategoryIdsOfPlace struct {
+	Delegate reflect.Value
+	Ids      []string
+}
+
+func (c *CategoryIdsOfPlace) SetDelegateField(d interface{}) {
+	c.Delegate = reflect.Indirect(reflect.ValueOf(d))
+	categories := c.Delegate.FieldByName("Categories").Interface().([]*Category)
+	if len(categories) > 0 {
+		for _, v := range categories {
+			c.Ids = append(c.Ids, v.Id)
+		}
+	}
+}
+
+func (c CategoryIdsOfPlace) Value() (driver.Value, error) {
+	return c.Ids, nil
+}
+
+func (c *CategoryIdsOfPlace) Scan(src interface{}) error {
+	ids := src.([]string)
+	if len(ids) > 0 {
+		var categories []*Category
+		for _, id := range ids {
+			categories = append(categories, &Category{Id: id})
+		}
+		c.Delegate.FieldByName("Categories").Set(reflect.ValueOf(categories))
+	}
+	return nil
+}
+
 func TestBasicVirtualField(t *testing.T) {
 	mpr := NewMapperFunc("db", strings.ToLower)
 	mpr.Register(reflect.TypeOf(Address{}), "city_id", reflect.TypeOf(CityIdOfAddress{}))
+	mpr.Register(reflect.TypeOf([]*Category{}), "categories", reflect.TypeOf(CategoryIdsOfPlace{}))
 
-	p := Place{Id: "123", Name: "Shanghai", Address: &Address{Districts: []*District{{Id: "456", Type: "City"}}}}
+	p := Place{Id: "123",
+		Name:       "Shanghai",
+		Address:    &Address{Districts: []*District{{Id: "456", Type: "City"}}},
+		Categories: []*Category{{Id: "123", Name: "123"}},
+	}
 
 	mapping := mpr.TypeMap(reflect.TypeOf(p))
-	for _, key := range []string{"id", "name", "address.city_id"} {
-		if fi := mapping.GetByPath (key); fi == nil {
+	for _, key := range []string{"id", "name", "city_id", "categories"} {
+		if fi := mapping.GetByPath(key); fi == nil {
 			t.Errorf("Expecting to find key %s in mapping but did not.", key)
 		}
 	}
 
-	for _, key := range []string{"id", "name", "city_id"} {
-		if fi := mapping.GetByName (key); fi == nil {
+	for _, key := range []string{"id", "name", "city_id", "categories"} {
+		if fi := mapping.GetByName(key); fi == nil {
 			t.Errorf("Expecting to find key %s in mapping but did not.", key)
 		}
 	}
 
-	values := mpr.FieldsByName(reflect.ValueOf(p), []string{"id", "name", "city_id"})
+	values := mpr.FieldsByName(reflect.ValueOf(&p), []string{"id", "name", "city_id", "categories"})
 	assert.Equal(t, values[0].String(), p.Id)
 	assert.Equal(t, values[1].String(), p.Name)
 
@@ -912,13 +954,19 @@ func TestBasicVirtualField(t *testing.T) {
 	v, _ := valuer.Value()
 	assert.Equal(t, v.(string), p.Address.Districts[0].Id)
 
+	valuer = values[3].Interface().(driver.Valuer)
+	v, _ = valuer.Value()
+	assert.Equal(t, v.([]string), []string{p.Categories[0].Id})
+
 	//reflect.Indirect(values[0]).Set(reflect.ValueOf("321"))
 	//reflect.Indirect(values[1]).Set(reflect.ValueOf("Beijing"))
 	values[2].Interface().(sql.Scanner).Scan("654")
+	values[3].Interface().(sql.Scanner).Scan([]string{"654"})
 
 	//assert.Equal(t, p.Id, "321")
 	//assert.Equal(t, p.Name, "Beijing")
 	assert.Equal(t, p.Address.Districts[0].Id, "654")
+	assert.Equal(t, p.Categories[0].Id, "654")
 }
 
 type E1 struct {

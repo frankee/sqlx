@@ -7,6 +7,7 @@
 package reflectx
 
 import (
+	"fmt"
 	"reflect"
 	"runtime"
 	"strings"
@@ -27,6 +28,8 @@ type FieldInfo struct {
 
 	Virtual     bool
 	VirtualType reflect.Type
+
+	TypeName string
 }
 
 // A StructMap is an index of field metadata for a struct.
@@ -231,30 +234,59 @@ func (m *Mapper) TraversalsByNameFunc(t reflect.Type, names []string, fn func(in
 // FieldByIndexes returns a value for the field given by the struct traversal
 // for the given value.
 func FieldByIndexes(v reflect.Value, indexes []int, m *Mapper) reflect.Value {
-	tm := m.TypeMap(v.Type())
+	value := v
+	values := make([]reflect.Value, 0, len(indexes))
+
+	tm := m.TypeMap(value.Type())
 	fi := tm.Tree
-	for _, i := range indexes {
+
+	ts := v.Type().String()
+	fmt.Println(ts)
+	for level, i := range indexes {
 		fi = fi.Children[i]
-		if !fi.Virtual {
-			v = reflect.Indirect(v).Field(i)
-			// if this is a pointer and it's nil, allocate a new value and set it
-			if v.Kind() == reflect.Ptr && v.IsNil() {
-				alloc := reflect.New(Deref(v.Type()))
-				v.Set(alloc)
+		vs := value.Type().String()
+		fmt.Println(vs)
+
+		if fi.Virtual {
+			var parent reflect.Value
+			if level == 0 {
+				parent = v
+			} else {
+				parent = values[level-1]
 			}
-			if v.Kind() == reflect.Map && v.IsNil() {
-				v.Set(reflect.MakeMap(v.Type()))
-			}
-		} else {
+
 			alloc := reflect.New(Deref(fi.VirtualType))
 
 			method := alloc.MethodByName("SetDelegateField")
-			method.Call([]reflect.Value{v})
+
+			if parent.Kind() == reflect.Slice || parent.Kind() == reflect.Map {
+				var grand reflect.Value
+				if level < 2 {
+					grand = v
+				} else {
+					grand = values[level-2]
+				}
+				method.Call([]reflect.Value{grand.Addr()})
+			} else {
+				method.Call([]reflect.Value{parent})
+			}
 
 			return alloc
+		} else {
+			value = reflect.Indirect(value).Field(i)
+			values = append(values, value)
+
+			// if this is a pointer and it's nil, allocate a new value and set it
+			if value.Kind() == reflect.Ptr && value.IsNil() {
+				alloc := reflect.New(Deref(value.Type()))
+				value.Set(alloc)
+			}
+			if value.Kind() == reflect.Map && value.IsNil() {
+				value.Set(reflect.MakeMap(value.Type()))
+			}
 		}
 	}
-	return v
+	return value
 }
 
 // FieldByIndexesReadOnly returns a value for a particular struct traversal,
@@ -392,6 +424,8 @@ QueueLoop:
 		tq := queue[0]
 		queue = queue[1:]
 
+		fmt.Sprintf("type name: %s, field name: %s, pp: %s", tq.t.Name(), tq.fi.Name, tq.pp)
+
 		// ignore recursive field
 		for p := tq.fi.Parent; p != nil; p = p.Parent {
 			if tq.fi.Field.Type == p.Field.Type {
@@ -400,30 +434,33 @@ QueueLoop:
 		}
 
 		nChildren := 0
+		tn := tq.t.String()
+		fmt.Println(tn)
 		if fields, ok := mapper.registry[tq.t]; ok {
 			nChildren = len(fields)
 			tq.fi.Children = make([]*FieldInfo, nChildren)
 			fieldPos := 0
 			for name, field := range fields {
-				//f := tq.t.Field(fieldPos)
 				fi := FieldInfo{
 					Field:       reflect.StructField{},
 					Name:        name,
 					Zero:        reflect.New(field).Elem(),
 					Virtual:     true,
 					VirtualType: field,
+					TypeName:    field.Name(),
 				}
 
-				if tq.pp == "" {
+				if tq.fi.Parent.Path == "" {
 					fi.Path = fi.Name
 				} else {
-					fi.Path = tq.pp + "." + fi.Name
+					fi.Path = tq.fi.Parent.Path + "." + fi.Name
 				}
 
 				fi.Index = apnd(tq.fi.Index, fieldPos)
 				fi.Parent = tq.fi
 				tq.fi.Children[fieldPos] = &fi
 				m = append(m, &fi)
+				fieldPos++
 			}
 			continue
 		}
@@ -442,15 +479,24 @@ QueueLoop:
 			tag, name := parseName(f, tagName, mapFunc, tagMapFunc)
 
 			// if the name is "-", disabled via a tag, skip it
-			if name == "-" {
+			if name == "-" ||
+				strings.HasPrefix(name, "XXX_") ||
+				strings.HasPrefix(name, "x_x_x_") ||
+				strings.HasPrefix(name, "xxx_") {
+				continue
+			}
+
+			// skip unexported fields
+			if len(f.PkgPath) != 0 && !f.Anonymous {
 				continue
 			}
 
 			fi := FieldInfo{
-				Field:   f,
-				Name:    name,
-				Zero:    reflect.New(f.Type).Elem(),
-				Options: parseOptions(tag),
+				Field:    f,
+				Name:     name,
+				Zero:     reflect.New(f.Type).Elem(),
+				Options:  parseOptions(tag),
+				TypeName: f.Type.String(),
 			}
 
 			// if the path is empty this path is just the name
@@ -458,11 +504,6 @@ QueueLoop:
 				fi.Path = fi.Name
 			} else {
 				fi.Path = tq.pp + "." + fi.Name
-			}
-
-			// skip unexported fields
-			if len(f.PkgPath) != 0 && !f.Anonymous {
-				continue
 			}
 
 			// bfs search of anonymous embedded structs
@@ -473,7 +514,6 @@ QueueLoop:
 				}
 
 				fi.Embedded = true
-				fi.Index = apnd(tq.fi.Index, fieldPos)
 				nChildren := 0
 				ft := Deref(f.Type)
 				if ft.Kind() == reflect.Struct {
@@ -482,8 +522,10 @@ QueueLoop:
 				fi.Children = make([]*FieldInfo, nChildren)
 				queue = append(queue, typeQueue{Deref(f.Type), &fi, pp})
 			} else if fi.Zero.Kind() == reflect.Struct || (fi.Zero.Kind() == reflect.Ptr && fi.Zero.Type().Elem().Kind() == reflect.Struct) {
-				fi.Index = apnd(tq.fi.Index, fieldPos)
 				fi.Children = make([]*FieldInfo, Deref(f.Type).NumField())
+				queue = append(queue, typeQueue{Deref(f.Type), &fi, fi.Path})
+			} else if fields, ok := mapper.registry[f.Type]; ok {
+				fi.Children = make([]*FieldInfo, len(fields))
 				queue = append(queue, typeQueue{Deref(f.Type), &fi, fi.Path})
 			}
 
@@ -495,31 +537,23 @@ QueueLoop:
 	}
 
 	flds := &StructMap{Index: m, Tree: root, Paths: map[string]*FieldInfo{}, Names: map[string]*FieldInfo{}}
+	count := 0
 	for _, fi := range flds.Index {
+		// skip the virtual fields
+		if len(fi.Children) > 0 && fi.Children[0] != nil && fi.Children[0].Virtual {
+			continue
+		}
+
 		flds.Paths[fi.Path] = fi
 		if fi.Name != "" && !fi.Embedded {
 			flds.Names[fi.Path] = fi
 		}
+
+		count++
+		fmt.Println("count: ", count)
 	}
 
-	duplicatedNames := make(map[string]bool)
-	for _, fi := range flds.Index {
-		if fi.Name != "" && !fi.Embedded {
-			fld, ok := flds.Names[fi.Name]
-			if ok {
-				if fld.Parent.Parent != nil { // not first level field
-					duplicatedNames[fi.Name] = true
-				}
-			} else {
-				flds.Names[fi.Name] = fi
-			}
-		}
-	}
-
-	for key := range duplicatedNames {
-		delete(flds.Names, key)
-	}
-
+	// add alias `_` for `.` path style
 	for name, fi := range flds.Paths {
 		n := strings.Replace(name, ".", "_", -1)
 		if name != n {
