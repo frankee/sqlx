@@ -8,3 +8,5 @@ require (
 	github.com/mattn/go-sqlite3 v1.9.0
 	github.com/serenize/snaker v0.0.0-20171204205717-a683aaf2d516 // indirect
 )
+
+go 1.13
